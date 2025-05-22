@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kullanıcı Kayıt & Giriş</title>
+<style>
+ body{font-family:sans-serif;padding:20px;}
+ h2{border-bottom:1px solid #ccc;padding-bottom:5px;margin-top:30px;}
+ form{margin-bottom:20px;}
+ label{display:inline-block;width:100px;margin-bottom:5px;}
+ input[type=text],input[type=password]{padding:8px;margin-bottom:10px;border:1px solid #ccc;border-radius:4px;}
+ button{padding:10px 15px;background:#007bff;color:#fff;border:none;border-radius:4px;cursor:pointer;}
+ button:hover{background:#0056b3;}
+ #message{margin-top:20px;font-weight:bold;}
+</style>
+</head>
+<body>
+<h1>WhatsApp Klonu</h1>
+
+<h2>Kayıt Ol</h2>
+<form id="registerForm">
+  <label for="regUsername">Kullanıcı Adı:</label>
+  <input type="text" id="regUsername" required><br>
+  <label for="regPassword">Şifre:</label>
+  <input type="password" id="regPassword" required><br>
+  <button type="submit">Kayıt Ol</button>
+</form>
+
+<h2>Giriş Yap</h2>
+<form id="loginForm">
+  <label for="loginUsername">Kullanıcı Adı:</label>
+  <input type="text" id="loginUsername" required><br>
+  <label for="loginPassword">Şifre:</label>
+  <input type="password" id="loginPassword" required><br>
+  <button type="submit">Giriş Yap</button>
+</form>
+
+<p id="message"></p>
+
+<script>
+const registerForm=document.getElementById('registerForm');
+const loginForm   =document.getElementById('loginForm');
+const msgEl       =document.getElementById('message');
+
+/* -------- Kayıt -------- */
+registerForm.addEventListener('submit',async e=>{
+  e.preventDefault();
+  const username=document.getElementById('regUsername').value.trim();
+  const password=document.getElementById('regPassword').value;
+  msgEl.textContent='';
+  try{
+    const res =await fetch('/auth/register',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({username,password})
+    });
+    const data=await res.json();
+    msgEl.textContent=res.ok?(data.message||'✅ Kayıt başarılı!'):
+                            '❌ '+(data.error||'Kayıt hatası');
+    if(res.ok) registerForm.reset();
+  }catch(err){
+    console.error(err);
+    msgEl.textContent='❌ Sunucuya ulaşılamıyor.';
+  }
+});
+
+/* -------- Giriş -------- */
+loginForm.addEventListener('submit',async e=>{
+  e.preventDefault();
+  const username=document.getElementById('loginUsername').value.trim();
+  const password=document.getElementById('loginPassword').value;
+  msgEl.textContent='';
+  try{
+    const res =await fetch('/auth/login',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({username,password})
+    });
+    const data=await res.json();
+    if(res.ok && data.token){
+      /* ---- Oturum verilerini sadece bu sekme için sakla ---- */
+      sessionStorage.setItem('token',    data.token);
+      sessionStorage.setItem('user_id',  String(data.user_id));
+      sessionStorage.setItem('username', data.username);
+
+      msgEl.textContent='✅ Giriş başarılı, yönlendiriliyorsunuz…';
+      setTimeout(()=>location.href='/chat',800);
+    }else{
+      msgEl.textContent='❌ '+(data.error||'Hatalı kullanıcı adı/şifre');
+    }
+  }catch(err){
+    console.error(err);
+    msgEl.textContent='❌ Sunucuya ulaşılamıyor.';
+  }
+});
+</script>
+</body>
+</html>

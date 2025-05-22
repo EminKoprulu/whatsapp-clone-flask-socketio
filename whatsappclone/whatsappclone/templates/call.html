@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8">
+  <title>Sesli Arama</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.0/socket.io.min.js"></script>
+  <style>
+    body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #f0f0f0; }
+    h1 { margin-bottom: 20px; }
+    audio { margin-top: 20px; border: 1px solid #ccc; border-radius: 8px; min-width: 300px; display: block; }
+    .call-controls button {
+      padding: 12px 20px;
+      margin: 8px;
+      border-radius: 20px;
+      border: none;
+      cursor: pointer;
+      font-size: 16px;
+      transition: background-color 0.3s ease;
+      box-shadow: 0 2px 5px rgba(0,0,0,0.15);
+    }
+    #hangupButton {
+      background-color: #e74c3c;
+      color: white;
+    }
+    #hangupButton:hover {
+      background-color: #c0392b;
+    }
+    #status {
+      margin-top: 15px;
+      font-weight: bold;
+      color: #333;
+      min-height: 20px;
+      padding: 5px 10px;
+      background-color: #fff;
+      border-radius: 5px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+      text-align: center;
+      max-width: 90%;
+    }
+    .error-message {
+        color: red !important;
+        background-color: #ffebee !important;
+        border: 1px solid red;
+    }
+    .info-message {
+        color: #007bff;
+        background-color: #e7f3ff;
+        border: 1px solid #007bff;
+    }
+  </style>
+</head>
+<body>
+  <h1>📞 Sesli Arama</h1>
+  <p id="status">Bağlantı bekleniyor...</p>
+  <audio id="remoteAudio" autoplay></audio>
+  <div class="call-controls" style="margin-top: 20px;">
+    <button id="hangupButton" style="display:none;">Çağrıyı Bitir</button>
+  </div>
+
+  <script>
+    const urlParams = new URLSearchParams(window.location.search);
+    const userId = urlParams.get("me");
+    const targetId = urlParams.get("to");
+
+    console.log(`Sayfa yüklendi: userId=${userId}, targetId=${targetId}, action=${urlParams.get('action')}`);
+
+    const socket = io("http://" + location.hostname + ":5000");
+
+    // YENİ EKLENDİ: Tüm gelen Socket.IO olaylarını dinlemek için
+    if (socket) {
+        socket.onAny((eventName, ...args) => {
+          console.log(`[SOCKET.IO DEBUG] Alınan olay: ${eventName}`, args);
+        });
+        console.log("[SOCKET.IO DEBUG] 'onAny' dinleyicisi kaydedildi.");
+    } else {
+        console.error("[SOCKET.IO DEBUG] Soket nesnesi tanımsız, 'onAny' dinleyicisi kaydedilemedi!");
+    }
+
+
+    let pc = null;
+    const statusEl = document.getElementById("status");
+    const remoteAudio = document.getElementById("remoteAudio");
+    const hangupButton = document.getElementById("hangupButton");
+
+    let localStream = null;
+    let isCallActive = false;
+
+    function updateStatus(message, type = "info") {
+        console.log(`[STATUS] ${type}: ${message}`);
+        statusEl.textContent = message;
+        statusEl.classList.remove("error-message", "info-message");
+        if (type === "error") {
+            statusEl.classList.add("error-message");
+        } else if (type === "info") {
+            statusEl.classList.add("info-message");
+        }
+    }
+
+    function closeCallResources(notifyPeer = true) {
+        console.log("closeCallResources çağrıldı. notifyPeer:", notifyPeer);
+
+        if (notifyPeer && isCallActive && targetId && socket.connected) {
+            console.log(`Çağrı bitirme (hangup) sinyali User ${targetId}'ye gönderiliyor.`);
+            socket.emit("hangup", { to: targetId, from: userId });
+        }
+
+        if (localStream) {
+            localStream.getTracks().forEach(track => {
+                track.stop();
+            });
+            localStream = null;
+            console.log("Lokal medya stream ve track'leri durduruldu.");
+        }
+
+        if (pc) {
+            console.log("Mevcut PeerConnection kapatılıyor. Durumu:", pc.signalingState);
+            pc.onicecandidate = null;
+            pc.oniceconnectionstatechange = null;
+            pc.ontrack = null;
+            pc.onsignalingstatechange = null;
+
+            if (typeof pc.getTransceivers === "function") {
+                pc.getTransceivers().forEach(transceiver => {
+                    if (transceiver.stop) {
+                        transceiver.stop();
+                    }
+                });
+                 console.log("Transceiver'lar durduruldu.");
+            }
+
+            if (pc.signalingState !== "closed") {
+                pc.close();
+                console.log("RTCPeerConnection.close() çağrıldı.");
+            }
+            pc = null;
+            console.log("PeerConnection nesnesi null yapıldı.");
+        }
+
+        if (remoteAudio) {
+            remoteAudio.srcObject = null;
+            remoteAudio.pause();
+            remoteAudio.load();
+            console.log("Remote audio elementi sıfırlandı.");
+        }
+
+        isCallActive = false;
+        hangupButton.style.display = "none";
+
+        const currentStatus = statusEl.textContent;
+        if (!currentStatus.includes("sonlandırıldı") && !currentStatus.includes("sonlandırdı")) {
+            updateStatus("Çağrı sonlandırıldı.");
+        }
+        console.log("Çağrı sonlandırma işlemleri tamamlandı.");
+    }
+
+    function initializePeerConnection() {
+        console.log("initializePeerConnection çağrıldı.");
+        if (pc) {
+            console.warn("initializePeerConnection: Mevcut bir 'pc' nesnesi bulundu. Kapatılıyor...");
+            closeCallResources(false);
+        }
+
+        updateStatus("Bağlantı bileşenleri hazırlanıyor...");
+        try {
+            pc = new RTCPeerConnection({
+              iceServers: [
+                { urls: "stun:stun.l.google.com:19302" },
+              ]
+            });
+            console.log("Yeni RTCPeerConnection nesnesi oluşturuldu:", pc);
+        } catch (error) {
+            console.error("RTCPeerConnection oluşturulamadı:", error);
+            updateStatus("HATA: WebRTC başlatılamadı. Tarayıcınız desteklemiyor olabilir.", "error");
+            return;
+        }
+
+        pc.onicecandidate = ({ candidate }) => {
+          if (!pc) { console.warn("onicecandidate: pc is null"); return; }
+          if (candidate) {
+            console.log("YEREL ICE ADAYI (to:", targetId, "):", candidate);
+            socket.emit("ice-candidate", { to: targetId, candidate: candidate, from_user_id: userId });
+          } else {
+            console.log("Tüm yerel ICE adayları toplandı.");
+          }
+        };
+
+        pc.oniceconnectionstatechange = () => {
+          if (!pc) { console.warn("oniceconnectionstatechange: pc is null"); return; }
+          console.log("ICE BAĞLANTI DURUMU DEĞİŞTİ:", pc.iceConnectionState);
+          switch (pc.iceConnectionState) {
+            case "checking":
+              updateStatus("Bağlantı kontrol ediliyor...");
+              break;
+            case "connected":
+            case "completed":
+              updateStatus("Bağlantı kuruldu! Sesli görüşme aktif.");
+              isCallActive = true;
+              hangupButton.style.display = "inline-block";
+              break;
+            case "failed":
+              updateStatus("Bağlantı kurulamadı (ICE failed).", "error");
+              console.error("ICE connection failed. PC state:", JSON.stringify(pc, null, 2));
+              closeCallResources();
+              break;
+            case "disconnected":
+              updateStatus("Bağlantı kesildi (ICE disconnected).", "error");
+              closeCallResources();
+              break;
+            case "closed":
+              updateStatus("Bağlantı kapatıldı (ICE closed).");
+              closeCallResources(false);
+              break;
+            default:
+              updateStatus(`Bağlantı durumu: ${pc.iceConnectionState}...`);
+          }
+        };
+
+        pc.ontrack = (event) => {
+          if (!pc) { console.warn("ontrack: pc is null"); return; }
+          console.log("UZAK MEDYA (SES) TRACK'İ ALINDI:", event);
+          if (event.streams && event.streams[0]) {
+            console.log("Uzak stream remoteAudio elementine atanıyor. Stream:", event.streams[0], "Tracks:", event.streams[0].getTracks());
+            if (remoteAudio.srcObject !== event.streams[0]) {
+                remoteAudio.srcObject = event.streams[0];
+            }
+            remoteAudio.play().then(() => {
+                console.log("Remote audio başarıyla oynatılıyor.");
+            }).catch(e => {
+                console.error("Remote audio otomatik oynatma hatası:", e);
+                updateStatus("⚠️ Karşıdan ses var ama otomatik oynatılamadı. Sayfaya tıklayın.", "error");
+            });
+          } else {
+            console.warn("ontrack: Gelen event.streams[0] tanımsız veya boş.");
+          }
+        };
+
+        pc.onsignalingstatechange = () => {
+            if (!pc) { console.warn("onsignalingstatechange: pc is null"); return; }
+            console.log("Sinyalleşme durumu değişti:", pc.signalingState);
+        };
+    }
+
+    socket.on("connect", () => {
+      console.log("Socket.IO sunucusuna başarıyla bağlandı. SID:", socket.id);
+      socket.emit("join_private_room", { user_id: userId });
+      updateStatus(`Sinyal sunucusuna bağlandı. Kullanıcı ID: ${userId}`);
+      handleCallLogic();
+    });
+
+    socket.on("disconnect", (reason) => {
+        console.error("Socket.IO bağlantısı kesildi:", reason);
+        updateStatus("Sinyal sunucusuyla bağlantı kesildi! Sayfayı yenileyin.", "error");
+        closeCallResources(false);
+    });
+
+    function handleCallLogic() {
+        if (!userId || !targetId || userId === "null" || targetId === "null" || userId === "undefined" || targetId === "undefined") {
+            updateStatus("HATA: Geçerli kullanıcı (me) veya hedef (to) ID'si URL'de doğru şekilde belirtilmemiş.", "error");
+            console.error(`Hatalı veya eksik URL parametreleri: me='${userId}', to='${targetId}'.`);
+            return;
+        }
+
+        const action = urlParams.get('action');
+        console.log(`handleCallLogic: userId=${userId}, targetId=${targetId}, action='${action}'`);
+
+        if (action === 'start') {
+             console.log(`KARAR: ARAMA BAŞLATILACAK. Arayan: ${userId}, Aranan: ${targetId}`);
+             startCall();
+        } else {
+             updateStatus(`Kullanıcı ${targetId} ile bağlantı bekleniyor. (Bu taraf aranan)`);
+             console.log(`KARAR: ARAMA BEKLENİYOR. Aranan: ${userId}, Arayan olası: ${targetId}`);
+        }
+    }
+
+    console.log("DEBUG: 'offer' olayı için dinleyici (listener) kaydediliyor.");
+    socket.on("offer", async ({ from_user_id, sdp }) => {
+      console.log(`[OFFER ALINDI] User ${from_user_id}'den. Mevcut PC:`, pc, "LocalStream:", localStream);
+      if (String(from_user_id) === String(userId)) {
+          console.warn("Kendi offer'ımız geldi, dikkate alınmıyor.");
+          return;
+      }
+
+      closeCallResources(false);
+      initializePeerConnection();
+
+      if (!pc) {
+          console.error("[OFFER İŞLEME] HATA: PeerConnection başlatılamadı.");
+          updateStatus("Hata: Arama bileşenleri başlatılamadı.", "error");
+          return;
+      }
+      console.log("[OFFER İŞLEME] Yeni PC başlatıldı:", pc);
+
+      try {
+        console.log("[OFFER İŞLEME] setRemoteDescription(offer) deneniyor. Gelen SDP:", sdp);
+        await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+        console.log("[OFFER İŞLEME] setRemoteDescription(offer) BAŞARILI. Sinyal durumu:", pc.signalingState);
+
+        console.log("[OFFER İŞLEME] Mikrofon erişimi isteniyor...");
+        localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        console.log("[OFFER İŞLEME] Mikrofon erişimi BAŞARILI. Stream:", localStream, "Tracks:", localStream.getTracks());
+
+        if (!localStream.getTracks().length) {
+            console.error("[OFFER İŞLEME] HATA: localStream'de hiç track bulunamadı!");
+            updateStatus("HATA: Mikrofon track'leri alınamadı.", "error");
+            closeCallResources();
+            return;
+        }
+
+        localStream.getTracks().forEach(track => {
+            console.log(`[OFFER İŞLEME] Lokal ses track (${track.kind}, ${track.label}, ${track.id}) RTCPeerConnection'a ekleniyor.`);
+            if (pc && typeof pc.addTrack === "function") {
+                 const sender = pc.addTrack(track, localStream);
+                 console.log(`[OFFER İŞLEME] pc.addTrack çağrıldı. Dönen sender:`, sender);
+            } else {
+                console.error("[OFFER İŞLEME] HATA: pc veya pc.addTrack tanımsız!");
+            }
+        });
+        console.log("[OFFER İŞLEME] Tüm lokal track'ler eklendi. PC Senders:", pc.getSenders());
+
+
+        updateStatus(`User ${from_user_id}'den arama geldi, cevap (answer) oluşturuluyor...`);
+        console.log("[OFFER İŞLEME] createAnswer() deneniyor. Sinyal durumu:", pc.signalingState);
+        const answer = await pc.createAnswer();
+        console.log("[OFFER İŞLEME] createAnswer() BAŞARILI. Oluşturulan Answer SDP:", answer);
+
+        console.log("[OFFER İŞLEME] setLocalDescription(answer) deneniyor.");
+        await pc.setLocalDescription(answer);
+        console.log("[OFFER İŞLEME] setLocalDescription(answer) BAŞARILI. Sinyal durumu:", pc.signalingState);
+
+        console.log(`[OFFER İŞLEME] Cevap (answer) User ${userId}'den User ${from_user_id}'ye gönderiliyor.`);
+        socket.emit("answer", { to: from_user_id, sdp: pc.localDescription, from_user_id: userId });
+        updateStatus("Arama kabul edildi, bağlantı kuruluyor...");
+      } catch (err) {
+        console.error("[OFFER İŞLEME] HATA:", err);
+        updateStatus(`⚠️ Hata (offer işleme): ${err.name} - ${err.message}`, "error");
+        closeCallResources();
+      }
+    });
+
+    socket.on("answer", async ({ from_user_id, sdp }) => {
+      console.log(`[ANSWER ALINDI] User ${from_user_id}'den. Mevcut PC:`, pc);
+      if (!pc) {
+          console.warn("[ANSWER İŞLEME] Answer alındı ama PeerConnection (pc) mevcut değil. Sinyal durumu:", pc ? pc.signalingState : "PC YOK");
+          return;
+      }
+      console.log("[ANSWER İŞLEME] Gelen Answer SDP:", sdp);
+      try {
+        console.log("[ANSWER İŞLEME] setRemoteDescription(answer) deneniyor. Sinyal durumu:", pc.signalingState);
+        await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+        console.log("[ANSWER İŞLEME] setRemoteDescription(answer) BAŞARILI. Sinyal durumu:", pc.signalingState);
+        updateStatus("Cevap alındı, bağlantı kuruluyor...");
+      } catch (err) {
+        console.error("[ANSWER İŞLEME] HATA:", err);
+        updateStatus(`⚠️ Hata (answer işleme): ${err.name} - ${err.message}`, "error");
+        closeCallResources();
+      }
+    });
+
+    socket.on("ice-candidate", ({ from_user_id, candidate }) => {
+      console.log(`[ICE ADAYI ALINDI] User ${from_user_id}'den. Aday:`, candidate, "Mevcut PC:", pc);
+      if (!pc) {
+          console.warn("[ICE İŞLEME] ICE adayı alındı ama PeerConnection (pc) mevcut değil.");
+          return;
+      }
+      if (candidate) {
+        pc.addIceCandidate(new RTCIceCandidate(candidate))
+          .then(() => console.log("[ICE İŞLEME] addIceCandidate BAŞARILI."))
+          .catch(e => {
+            console.error("[ICE İŞLEME] Alınan ICE adayı eklenirken HATA:", e);
+          });
+      } else {
+        console.log(`[ICE İŞLEME] User ${from_user_id} tüm ICE adaylarını gönderdi (null candidate).`);
+      }
+    });
+
+    async function startCall() {
+      console.log(`[STARTCALL] ARAMA BAŞLATILIYOR: User ${targetId} aranıyor... Mevcut PC:`, pc, "LocalStream:", localStream);
+      updateStatus(`Kullanıcı ${targetId} aranıyor... (Teklif oluşturuluyor)`);
+
+      closeCallResources(false);
+      initializePeerConnection();
+
+      if (!pc) {
+          console.error("[STARTCALL] HATA: Arama başlatılamadı, PeerConnection başlatılamadı.");
+          updateStatus("Hata: Arama bileşenleri başlatılamadı.", "error");
+          return;
+      }
+      console.log("[STARTCALL] Yeni PC başlatıldı:", pc);
+
+      try {
+        console.log("[STARTCALL] Mikrofon erişimi isteniyor...");
+        localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        console.log("[STARTCALL] Mikrofon erişimi BAŞARILI. Stream:", localStream, "Tracks:", localStream.getTracks());
+
+        if (!localStream.getTracks().length) {
+            console.error("[STARTCALL] HATA: localStream'de hiç track bulunamadı!");
+            updateStatus("HATA: Mikrofon track'leri alınamadı.", "error");
+            closeCallResources();
+            return;
+        }
+
+        localStream.getTracks().forEach(track => {
+            console.log(`[STARTCALL] Lokal ses track (${track.kind}, ${track.label}, ${track.id}) RTCPeerConnection'a ekleniyor.`);
+            if (pc && typeof pc.addTrack === "function") {
+                const sender = pc.addTrack(track, localStream);
+                console.log(`[STARTCALL] pc.addTrack çağrıldı. Dönen sender:`, sender);
+            } else {
+                 console.error("[STARTCALL] HATA: pc veya pc.addTrack tanımsız!");
+            }
+        });
+        console.log("[STARTCALL] Tüm lokal track'ler eklendi. PC Senders:", pc.getSenders());
+
+        console.log("[STARTCALL] createOffer() deneniyor. Sinyal durumu:", pc.signalingState);
+        const offer = await pc.createOffer();
+        console.log("[STARTCALL] createOffer() BAŞARILI. Oluşturulan Offer SDP:", offer);
+
+        console.log("[STARTCALL] setLocalDescription(offer) deneniyor.");
+        await pc.setLocalDescription(offer);
+        console.log("[STARTCALL] setLocalDescription(offer) BAŞARILI. Sinyal durumu:", pc.signalingState);
+
+        console.log(`[STARTCALL] Arama teklifi (offer) User ${targetId}'ye gönderiliyor.`);
+        socket.emit("offer", {
+          to: targetId,
+          sdp: pc.localDescription,
+          from_user_id: userId
+        });
+        updateStatus("Arama teklifi gönderildi. Cevap bekleniyor...");
+        hangupButton.style.display = "inline-block";
+      } catch (err) {
+        console.error("[STARTCALL] HATA:", err);
+        let errorMessage = "🎙 Mikrofon/Arama başlatma hatası: ";
+        if (err.name === "NotFoundError" || err.name === "DevicesNotFoundError") {
+            errorMessage += "Mikrofon bulunamadı veya erişim izni verilmedi.";
+        } else if (err.name === "NotAllowedError" || err.name === "PermissionDeniedError") {
+            errorMessage += "Mikrofon erişim izni reddedildi.";
+        } else {
+            errorMessage += `${err.name} - ${err.message}`;
+        }
+        updateStatus(errorMessage, "error");
+        closeCallResources();
+      }
+    }
+
+    hangupButton.addEventListener("click", () => {
+        console.log("KULLANICI TARAFINDAN 'Çağrıyı Bitir' butonuna tıklandı.");
+        updateStatus("Çağrı sonlandırılıyor...");
+        closeCallResources(true);
+    });
+
+    socket.on("hangup_received", ({ from }) => {
+        console.log(`[HANGUP ALINDI] User ${from}'dan. Mevcut PC:`, pc, "isCallActive:", isCallActive);
+        if (!pc && !isCallActive) {
+            console.log(`hangup_received User ${from}'dan geldi ama aktif çağrı/pc yok. Dikkate alınmıyor.`);
+            return;
+        }
+        if ( (targetId && String(from) === String(targetId)) || String(from) === String(userId) ) {
+            console.log(`KARŞI TARAFTAN (User ${from}) çağrı sonlandırma (hangup_received) sinyali alındı.`);
+            updateStatus(`User ${from} çağrıyı sonlandırdı.`);
+            closeCallResources(false);
+        } else {
+            console.log(`Alakasız bir kullanıcıdan (${from}) hangup_received sinyali alındı, dikkate alınmıyor. targetId: ${targetId}`);
+        }
+    });
+
+    window.addEventListener('beforeunload', (event) => {
+        if (isCallActive || pc) {
+            console.log("Sayfa kapatılıyor/yenileniyor, aktif çağrı/bağlantı sonlandırılıyor...");
+            closeCallResources(true);
+        }
+    });
+
+  </script>
+</body>
+</html>
